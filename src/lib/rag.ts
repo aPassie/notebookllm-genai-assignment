@@ -1,43 +1,23 @@
-// indexing and grounded chat orchestration with a free-tier model fallback chain
+// indexing and CRAG-powered grounded chat orchestration
+//
+// CRAG flow: embedQuery → Qdrant top-8 → evaluator scores all chunks (1 batched call)
+//   → route by avg(top-3) confidence → chunk-level refinement → web search if needed
+//   → build context with provenance tags → grounded LLM answer
 
 import { randomUUID } from "node:crypto";
-import OpenAI from "openai";
 import { chunkPages, type PageText } from "./chunking";
 import { embedPassages, embedQuery } from "./embeddings";
+import { evaluateChunks, classifyRetrieval } from "./evaluator";
+import { getChatClient, chatModelChain, isTransient } from "./llm";
 import { COLLECTION, ensureCollection, getQdrant } from "./qdrant";
-import type { ChatTurn, IngestResult, Source } from "./types";
+import { refineChunks, type RefinedChunk } from "./refine";
+import { searchWeb } from "./websearch";
+import type { ChatTurn, CragMeta, IngestResult, Source, WebResult } from "./types";
 
 const UPSERT_BATCH = 100;
+const TOP_K = 8;
 
-const DEFAULT_CHAT_MODEL = "openai/gpt-oss-120b:free";
-const FALLBACK_CHAT_MODELS = [
-  "openai/gpt-oss-20b:free",
-  "google/gemma-4-26b-a4b-it:free",
-  "meta-llama/llama-3.3-70b-instruct:free",
-];
-
-function getChatClient(): OpenAI {
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) throw new Error("OPENROUTER_API_KEY is not set");
-  return new OpenAI({
-    apiKey,
-    baseURL: "https://openrouter.ai/api/v1",
-    defaultHeaders: {
-      "HTTP-Referer": process.env.OPENROUTER_SITE_URL ?? "http://localhost:3000",
-      "X-Title": "NotebookLM RAG",
-    },
-  });
-}
-
-function chatModelChain(): string[] {
-  const primary = process.env.OPENROUTER_CHAT_MODEL ?? DEFAULT_CHAT_MODEL;
-  return [primary, ...FALLBACK_CHAT_MODELS.filter((m) => m !== primary)];
-}
-
-function isTransient(err: unknown): boolean {
-  const status = (err as { status?: number })?.status;
-  return status === 429 || status === 502 || status === 503 || status === 504;
-}
+// ── indexing (unchanged) ────────────────────────────────────────────────
 
 export async function indexDocument(
   pages: PageText[],
@@ -76,53 +56,124 @@ export async function indexDocument(
   return { docId, fileName, pages: pages.length, chunks: chunks.length };
 }
 
+// ── CRAG-powered answer ─────────────────────────────────────────────────
+
 export async function answerQuestion(
   docId: string,
   query: string,
   history: ChatTurn[] = [],
-): Promise<{ answer: string; sources: Source[] }> {
+): Promise<{ answer: string; sources: Source[]; cragMeta: CragMeta }> {
+  // 1. Retrieve — top-8 from Qdrant
   const queryVec = await embedQuery(query);
 
   const result = await getQdrant().search(COLLECTION, {
     vector: queryVec,
-    limit: 5,
+    limit: TOP_K,
     with_payload: true,
     filter: { must: [{ key: "docId", match: { value: docId } }] },
   });
 
-  const sources: Source[] = result
+  const retrieved = result
     .filter((m) => m.payload && typeof m.payload.text === "string")
     .map((m) => ({
+      text: String(m.payload!.text),
       page: Number(m.payload!.page ?? 0),
-      snippet: String(m.payload!.text),
       score: typeof m.score === "number" ? m.score : 0,
     }));
 
-  if (sources.length === 0) {
+  if (retrieved.length === 0) {
     return {
       answer:
         "I couldn't find anything in the uploaded document that addresses that. Try rephrasing or asking about a different topic from the file.",
       sources: [],
+      cragMeta: {
+        action: "INCORRECT",
+        totalRetrieved: 0,
+        relevantCount: 0,
+        filteredOut: 0,
+        webSearchUsed: false,
+        webResultCount: 0,
+      },
     };
   }
 
-  const context = sources
-    .map((s, i) => `[#${i + 1} | page ${s.page}]\n${s.snippet}`)
-    .join("\n\n---\n\n");
+  // 2. Evaluate — one batched LLM call on cheap model
+  const evalResults = await evaluateChunks(query, retrieved);
+
+  // 3. Classify — avg(top-3) against thresholds
+  const action = classifyRetrieval(evalResults);
+  console.log(`[crag] action=${action}, eval scores=${evalResults.map((r) => r.score.toFixed(2)).join(", ")}`);
+
+  // 4. Corrective action
+  let docChunks: RefinedChunk[] = [];
+  let webResults: WebResult[] = [];
+
+  switch (action) {
+    case "CORRECT":
+      docChunks = refineChunks(evalResults, retrieved);
+      break;
+
+    case "INCORRECT":
+      webResults = await searchWeb(query);
+      break;
+
+    case "AMBIGUOUS":
+      docChunks = refineChunks(evalResults, retrieved);
+      webResults = await searchWeb(query);
+      break;
+  }
+
+  // 5. Build context with provenance tags
+  const contextParts: string[] = [];
+
+  for (let i = 0; i < docChunks.length; i++) {
+    const c = docChunks[i];
+    contextParts.push(
+      `[DOC #${i + 1} | page ${c.page} | relevance ${(c.evalScore * 100).toFixed(0)}%]\n${c.text}`,
+    );
+  }
+
+  for (let i = 0; i < webResults.length; i++) {
+    const w = webResults[i];
+    contextParts.push(
+      `[WEB #${i + 1} | ${w.url}]\n${w.title}\n${w.content}`,
+    );
+  }
+
+  // nothing survived — refuse
+  if (contextParts.length === 0) {
+    return {
+      answer:
+        "I couldn't find relevant information in the uploaded document to answer that, and web search is not available. Try rephrasing or asking about a different topic from the file.",
+      sources: [],
+      cragMeta: {
+        action,
+        totalRetrieved: retrieved.length,
+        relevantCount: 0,
+        filteredOut: retrieved.length,
+        webSearchUsed: false,
+        webResultCount: 0,
+      },
+    };
+  }
+
+  const context = contextParts.join("\n\n---\n\n");
 
   const systemPrompt = [
-    "You are a NotebookLM-style assistant that answers questions strictly using the provided document excerpts.",
+    "You are a NotebookLM-style assistant that answers questions using the provided context.",
     "",
     "Rules:",
     "- Use ONLY the information in the context below. Do not use outside knowledge.",
     "- If the context does not contain the answer, say so plainly. Do not guess.",
-    "- Cite the supporting excerpts inline using the format [#n] (e.g. [#1], [#2]).",
-    "- Keep the answer focused and grounded. Quote phrasing from the document when helpful.",
+    "- Cite the supporting excerpts inline using their tags (e.g. [DOC #1], [WEB #2]).",
+    "- When context comes from both DOC and WEB sources, prefer DOC sources and note when citing WEB sources.",
+    "- Keep the answer focused and grounded. Quote phrasing from the context when helpful.",
     "",
     "Context:",
     context,
   ].join("\n");
 
+  // 6. Generate — main answer model with fallback chain
   const client = getChatClient();
   const messages = [
     { role: "system" as const, content: systemPrompt },
@@ -130,6 +181,7 @@ export async function answerQuestion(
     { role: "user" as const, content: query },
   ];
 
+  let answer = "No response generated.";
   let lastErr: unknown;
   for (const model of chatModelChain()) {
     try {
@@ -138,14 +190,41 @@ export async function answerQuestion(
         temperature: 0.1,
         messages,
       });
-      const answer =
-        completion.choices[0]?.message?.content?.trim() ?? "No response generated.";
-      return { answer, sources };
+      answer = completion.choices[0]?.message?.content?.trim() ?? answer;
+      break;
     } catch (err) {
       lastErr = err;
       if (!isTransient(err)) throw err;
       console.warn(`[chat] model ${model} transient error, falling back`);
     }
   }
-  throw lastErr;
+  if (answer === "No response generated." && lastErr) throw lastErr;
+
+  // 7. Build sources with provenance
+  const sources: Source[] = [
+    ...docChunks.map((c) => ({
+      page: c.page,
+      snippet: c.text,
+      score: c.evalScore,
+      origin: "doc" as const,
+    })),
+    ...webResults.map((w) => ({
+      page: 0,
+      snippet: w.content.slice(0, 500),
+      score: 0,
+      origin: "web" as const,
+      url: w.url,
+    })),
+  ];
+
+  const cragMeta: CragMeta = {
+    action,
+    totalRetrieved: retrieved.length,
+    relevantCount: docChunks.length,
+    filteredOut: retrieved.length - docChunks.length,
+    webSearchUsed: webResults.length > 0,
+    webResultCount: webResults.length,
+  };
+
+  return { answer, sources, cragMeta };
 }

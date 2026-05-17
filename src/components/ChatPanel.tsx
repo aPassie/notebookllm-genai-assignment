@@ -1,10 +1,10 @@
 "use client";
 
-// chat ui for the active document, with grounded answers and source citations
+// chat ui for the active document, with CRAG diagnostics and source provenance
 
 import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
-import type { Message, Source } from "@/lib/types";
+import type { CragMeta, Message, Source } from "@/lib/types";
 import type { ChatRecord } from "@/lib/useChats";
 import { readJson } from "@/lib/fetch";
 
@@ -53,11 +53,12 @@ export function ChatPanel({ chat, onAppend }: Props) {
           (data as { error?: string })?.error ??
             `Chat failed (${res.status} ${res.statusText})`,
         );
-      const payload = data as { answer: string; sources: Source[] };
+      const payload = data as { answer: string; sources: Source[]; cragMeta?: CragMeta };
       onAppend({
         role: "assistant",
         content: payload.answer,
         sources: payload.sources,
+        cragMeta: payload.cragMeta,
       });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Chat failed");
@@ -114,12 +115,14 @@ export function ChatPanel({ chat, onAppend }: Props) {
           </button>
         </div>
         <p className="max-w-3xl mx-auto mt-2 text-[11px] text-[var(--fg-subtle)] text-center">
-          enter to send · shift+enter for newline
+          enter to send · shift+enter for newline · powered by CRAG pipeline
         </p>
       </div>
     </div>
   );
 }
+
+// ── empty state ─────────────────────────────────────────────────────────
 
 function EmptyHint({
   fileName,
@@ -155,6 +158,8 @@ function EmptyHint({
   );
 }
 
+// ── message bubble ──────────────────────────────────────────────────────
+
 function MessageBubble({ message }: { message: Message }) {
   if (message.role === "user") {
     return (
@@ -172,6 +177,7 @@ function MessageBubble({ message }: { message: Message }) {
           <ReactMarkdown>{message.content}</ReactMarkdown>
         </div>
       </div>
+      {message.cragMeta && <CragBadge meta={message.cragMeta} />}
       {message.sources && message.sources.length > 0 && (
         <SourceList sources={message.sources} />
       )}
@@ -179,8 +185,92 @@ function MessageBubble({ message }: { message: Message }) {
   );
 }
 
+// ── CRAG diagnostics badge ──────────────────────────────────────────────
+
+const ACTION_STYLES: Record<string, { bg: string; border: string; text: string; label: string }> = {
+  CORRECT: {
+    bg: "rgba(34,197,94,0.10)",
+    border: "rgba(34,197,94,0.35)",
+    text: "#4ade80",
+    label: "CORRECT",
+  },
+  INCORRECT: {
+    bg: "rgba(239,68,68,0.10)",
+    border: "rgba(239,68,68,0.35)",
+    text: "#f87171",
+    label: "INCORRECT",
+  },
+  AMBIGUOUS: {
+    bg: "rgba(251,191,36,0.10)",
+    border: "rgba(251,191,36,0.35)",
+    text: "#fbbf24",
+    label: "AMBIGUOUS",
+  },
+};
+
+function CragBadge({ meta }: { meta: CragMeta }) {
+  const [open, setOpen] = useState(false);
+  const style = ACTION_STYLES[meta.action] ?? ACTION_STYLES.AMBIGUOUS;
+
+  return (
+    <div className="ml-2">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="inline-flex items-center gap-2 text-xs px-3 py-1.5 rounded-full border transition-colors"
+        style={{
+          background: style.bg,
+          borderColor: style.border,
+          color: style.text,
+        }}
+      >
+        <span className="w-1.5 h-1.5 rounded-full" style={{ background: style.text }} />
+        <span className="font-semibold tracking-wide">{style.label}</span>
+        <span style={{ color: "var(--fg-muted)" }}>· CRAG pipeline</span>
+        <span
+          className={`inline-block transition-transform ${open ? "rotate-90" : ""}`}
+          style={{ color: style.text }}
+        >
+          ▸
+        </span>
+      </button>
+
+      {open && (
+        <div
+          className="mt-2 rounded-2xl border p-3 text-xs grid grid-cols-2 gap-x-6 gap-y-1.5"
+          style={{ background: style.bg, borderColor: style.border }}
+        >
+          <Stat label="Retrieved" value={meta.totalRetrieved} />
+          <Stat label="Relevant" value={meta.relevantCount} accent />
+          <Stat label="Filtered out" value={meta.filteredOut} />
+          <Stat label="Web search" value={meta.webSearchUsed ? `${meta.webResultCount} results` : "skipped"} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Stat({ label, value, accent }: { label: string; value: string | number; accent?: boolean }) {
+  return (
+    <div className="flex items-center justify-between gap-2">
+      <span className="text-[var(--fg-muted)]">{label}</span>
+      <span className={accent ? "text-[var(--accent)] font-medium" : "text-[var(--fg)]"}>{value}</span>
+    </div>
+  );
+}
+
+// ── source list with provenance ─────────────────────────────────────────
+
 function SourceList({ sources }: { sources: Source[] }) {
   const [open, setOpen] = useState(false);
+  const docCount = sources.filter((s) => s.origin === "doc").length;
+  const webCount = sources.filter((s) => s.origin === "web").length;
+
+  const summary = [
+    docCount > 0 ? `${docCount} doc` : "",
+    webCount > 0 ? `${webCount} web` : "",
+  ].filter(Boolean).join(" + ");
+
   return (
     <div className="ml-2">
       <button
@@ -189,7 +279,7 @@ function SourceList({ sources }: { sources: Source[] }) {
         className="text-xs text-[var(--fg-muted)] hover:text-[var(--accent)] flex items-center gap-1.5 px-2 py-1 rounded-full"
       >
         <span className={`inline-block transition-transform ${open ? "rotate-90" : ""}`}>▸</span>
-        {sources.length} source{sources.length === 1 ? "" : "s"}
+        {summary} source{sources.length === 1 ? "" : "s"}
       </button>
       {open && (
         <ul className="mt-2 flex flex-col gap-2">
@@ -199,13 +289,28 @@ function SourceList({ sources }: { sources: Source[] }) {
               className="text-xs bg-[var(--bg-elev)]/60 border border-[var(--border)] rounded-2xl p-3"
             >
               <div className="flex items-center justify-between mb-1.5">
-                <span className="text-[var(--accent)] font-medium">
-                  [#{i + 1}] page {s.page}
-                </span>
-                <span className="text-[var(--fg-subtle)]">
-                  {(s.score * 100).toFixed(1)}% match
-                </span>
+                <div className="flex items-center gap-2">
+                  <OriginBadge origin={s.origin} />
+                  <span className="text-[var(--accent)] font-medium">
+                    {s.origin === "doc" ? `[#${i + 1}] page ${s.page}` : `[#${i + 1}]`}
+                  </span>
+                </div>
+                {s.origin === "doc" && (
+                  <span className="text-[var(--fg-subtle)]">
+                    {(s.score * 100).toFixed(0)}% relevant
+                  </span>
+                )}
               </div>
+              {s.origin === "web" && s.url && (
+                <a
+                  href={s.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-[var(--accent)] hover:underline text-[11px] block mb-1.5 truncate"
+                >
+                  {s.url}
+                </a>
+              )}
               <p className="text-[var(--fg-muted)] line-clamp-4 whitespace-pre-wrap">
                 {s.snippet}
               </p>
@@ -217,13 +322,31 @@ function SourceList({ sources }: { sources: Source[] }) {
   );
 }
 
+function OriginBadge({ origin }: { origin: "doc" | "web" }) {
+  const isDoc = origin === "doc";
+  return (
+    <span
+      className="text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded-md"
+      style={{
+        background: isDoc ? "rgba(34,197,94,0.15)" : "rgba(96,165,250,0.15)",
+        color: isDoc ? "#4ade80" : "#60a5fa",
+        border: `1px solid ${isDoc ? "rgba(34,197,94,0.30)" : "rgba(96,165,250,0.30)"}`,
+      }}
+    >
+      {origin}
+    </span>
+  );
+}
+
+// ── thinking indicator ──────────────────────────────────────────────────
+
 function AssistantThinking() {
   return (
     <div className="flex items-center gap-2 px-5 py-3.5 rounded-[24px] rounded-bl-md bg-[var(--bg-elev)]/60 border border-[var(--border)] w-fit">
       <span className="dot"></span>
       <span className="dot"></span>
       <span className="dot"></span>
-      <span className="ml-1 text-sm text-[var(--fg-muted)]">searching the document</span>
+      <span className="ml-1 text-sm text-[var(--fg-muted)]">evaluating & searching</span>
     </div>
   );
 }
