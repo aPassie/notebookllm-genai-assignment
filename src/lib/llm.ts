@@ -9,10 +9,10 @@ const FALLBACK_CHAT_MODELS = [
   "meta-llama/llama-3.3-70b-instruct:free",
 ];
 
-const EVALUATOR_MODEL = "meta-llama/llama-3.1-8b-instruct:free";
+const EVALUATOR_MODEL = "nvidia/nemotron-nano-9b-v2:free";
 const EVALUATOR_FALLBACKS = [
-  "google/gemma-4-12b-it:free",
-  "meta-llama/llama-3.3-70b-instruct:free",
+  "meta-llama/llama-3.2-3b-instruct:free",
+  "google/gemma-4-26b-a4b-it:free",
 ];
 
 let _client: OpenAI | null = null;

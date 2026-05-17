@@ -8,7 +8,7 @@ Upload a PDF or text file, ask questions, get answers grounded in the file with 
 - **Embeddings**: Jina `jina-embeddings-v3` (free tier)
 - **Vector DB**: Qdrant Cloud
 - **LLM (answer)**: OpenRouter, defaults to `openai/gpt-oss-120b:free` with a fallback chain
-- **LLM (evaluator)**: `meta-llama/llama-3.1-8b-instruct:free` — cheap model for CRAG chunk grading
+- **LLM (evaluator)**: `nvidia/nemotron-nano-9b-v2:free` — cheap model for CRAG chunk grading
 - **Web search**: Tavily (free tier, optional) — fallback for CRAG Incorrect/Ambiguous branches
 
 ## Pipeline — CRAG (Yan et al., 2024)
